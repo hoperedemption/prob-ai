@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 from matplotlib import cm
 
 from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
 
 
 # Set `EXTENDED_EVALUATION` to `True` in order to visualize your predictions.
@@ -31,78 +32,115 @@ class Model(object):
         We already provide a random number generator for reproducibility.
         """
         self.rng = np.random.default_rng(seed=0)
+        
+        self.k_clusters = 20
+        self.kmeans = None
+        self.local_gps = []         
+        self.local_scalers_x = []  
+        self.local_scalers_y = []   
+        self.global_scaler_y = StandardScaler()
 
-        # TODO: Add custom initialization for your model here if necessary
-        self.gp = None
-        self.scaler_x = StandardScaler()
-        self.scaler_y = StandardScaler()
+    def _find_closest_cluster(self, coordinates: np.ndarray) -> np.ndarray:
+        """Finds the index of the closest cluster for each coordinate."""
+        return self.kmeans.predict(coordinates)
 
     # Don't change the name or the signature of this function
     def predict_pollution_concentration(self, test_coordinates: np.ndarray, test_area_flags: np.ndarray) -> typing.Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Predict the pollution concentration for a given set of city_areas.
-        :param test_coordinates: city_areas as a 2d NumPy float array of shape (NUM_SAMPLES, 2)
-        :param test_area_flags: city_area info for every sample in a form of a bool array (NUM_SAMPLES,)
-        :return:
-            Tuple of three 1d NumPy float arrays, each of shape (NUM_SAMPLES,),
-            containing your predictions, the GP posterior mean, and the GP posterior stddev (in that order)
         """
+        num_samples = test_coordinates.shape[0]
+        
+        cluster_indices = self._find_closest_cluster(test_coordinates)
 
-        # TODO: Use your GP to estimate the posterior mean and stddev for each city_area here
-        gp_mean = np.zeros(test_coordinates.shape[0], dtype=float)
-        gp_std = np.zeros(test_coordinates.shape[0], dtype=float)
+        gp_mean = np.zeros(num_samples, dtype=float)
+        gp_std = np.zeros(num_samples, dtype=float)
 
-        test_coordinates_scaled = self.scaler_x.transform(test_coordinates)
-        gp_mean_scaled, gp_std_scaled = self.gp.predict(test_coordinates_scaled, return_std=True)
-        gp_mean = self.scaler_y.inverse_transform(gp_mean_scaled.reshape(-1, 1)).ravel()
-        gp_std = gp_std_scaled * self.scaler_y.scale_[0]
+        for k in range(self.k_clusters):
+            mask = (cluster_indices == k)
+            if not np.any(mask):
+                continue
+                
+            X_test_k = test_coordinates[mask]
+            
+            scaler_x_k = self.local_scalers_x[k]
+            X_test_scaled_k = scaler_x_k.transform(X_test_k)
+
+            gp_k = self.local_gps[k]
+
+            mean_scaled_k, std_scaled_k = gp_k.predict(X_test_scaled_k, return_std=True)
+            
+            # try:
+            #     mean_scaled_k, std_scaled_k = gp_k.predict(X_test_scaled_k, return_std=True)
+            # except np.linalg.LinAlgError:
+            #     # Fallback to mean and high uncertainty if local GP fails
+            #     mean_scaled_k = np.zeros_like(X_test_scaled_k[:, 0])
+            #     std_scaled_k = np.ones_like(X_test_scaled_k[:, 0]) * 2.0 
+
+            scaler_y_k = self.local_scalers_y[k]
+            gp_mean[mask] = scaler_y_k.inverse_transform(mean_scaled_k.reshape(-1, 1)).ravel()
+            gp_std[mask] = std_scaled_k * scaler_y_k.scale_[0]
 
 
-        # TODO: Use the GP posterior to form your predictions here (goal: loss < 21.8)
         predictions = gp_mean
         residential_mask = test_area_flags.astype(bool)
-        z_score = 0.6
-        ### baseline results trained with 1000 random sampled points
-        ### z=0 -> loss = 153.550
-        ### z=0.5 -> loss=83.595
-        ### z=0.6 -> 172.344
-        ### z=1 -> loss = 64.164
-        ### z=1.645 -> loss = 93.245 (loss=34.896 for 2000 random points, 5 minutes of training)
-        ### z=3 -> loss = 157.852
-        ### z=10 -> loss = 1926
-        ### z=e  -> loss = 253.259, (222.608 by setting train data to 1000, 238.868 for 2000 points)
+        
+        z_score = 1.0 
         predictions[residential_mask] = predictions[residential_mask] + z_score * gp_std[residential_mask]
+        
         return predictions, gp_mean, gp_std
 
     # Don't change the name or the signature of this function
     def fit_model_on_training_data(self, train_targets: np.ndarray, train_coordinates: np.ndarray, train_area_flags: np.ndarray):
         """
-        Fit your model on the given training data.
-        :param train_coordinates: Training features as a 2d NumPy float array of shape (NUM_SAMPLES, 2)
-        :param train_targets: Training pollution concentrations as a 1d NumPy float array of shape (NUM_SAMPLES,)
-        :param train_area_flags: Binary variable denoting whether the 2D training point is in the residential area (1) or not (0)
+        Fit your model on the given training data using K-Means clustering and local GPs.
         """
+        print(f"--- Fitting K-Means with K={self.k_clusters} -------------------------------------")
+        
+        self.kmeans = KMeans(n_clusters=self.k_clusters, random_state=42, n_init=5, max_iter=100)
+        cluster_labels = self.kmeans.fit_predict(train_coordinates)
+        
+        for k in range(self.k_clusters):
+            mask = (cluster_labels == k)
+            X_k = train_coordinates[mask]
+            y_k = train_targets[mask]
+            
+            n_k = X_k.shape[0]
+            print(f"Cluster {k+1}/{self.k_clusters}: n={n_k} samples.")
 
-        # TODO: Fit your model here
+            if n_k < 2: 
+                self.local_gps.append(None)
+                self.local_scalers_x.append(StandardScaler())
+                self.local_scalers_y.append(StandardScaler())
+                continue
+            
+            scaler_x_k = StandardScaler()
+            scaler_y_k = StandardScaler()
+            X_scaled_k = scaler_x_k.fit_transform(X_k)
+            y_scaled_k = scaler_y_k.fit_transform(y_k.reshape(-1, 1)).ravel()
 
-        num_samples = train_coordinates.shape[0]
-        random_indices = np.random.choice(num_samples, size=1000, replace=False)
+            self.local_scalers_x.append(scaler_x_k)
+            self.local_scalers_y.append(scaler_y_k)
 
-        train_coordinates_scaled = self.scaler_x.fit_transform(train_coordinates[random_indices])
-        train_targets_scaled = self.scaler_y.fit_transform(train_targets[random_indices].reshape(-1, 1)) # fit_transform expects 2D input
-        train_targets_scaled = train_targets_scaled.ravel() # convert back to (n, )
-
-        # Define kernel - Matern works well for spatial data
-        kernel = ConstantKernel(1.0) * Matern(length_scale=0.3, nu=1.5) + WhiteKernel(noise_level=0.1)
-        self.gp = GaussianProcessRegressor(
-            kernel = kernel,
-            alpha = 1e-5,
-            n_restarts_optimizer=5,
-            random_state = 42
-        )
-        print("Fitting gaussian processes -----------------------------------------------")
-        self.gp.fit(train_coordinates_scaled, train_targets_scaled)
-        print("Optimized kernel: ", self.gp.kernel_, "-----------------------------------")
+            local_kernel = ConstantKernel(1.0) * Matern(length_scale=0.3, nu=1.5) + WhiteKernel(noise_level=0.1)
+            
+            gp_k = GaussianProcessRegressor(
+                kernel=local_kernel,
+                alpha = 0,
+                n_restarts_optimizer=2,
+                random_state=42,
+                normalize_y=False 
+            )
+            
+            try:
+                gp_k.fit(X_scaled_k, y_scaled_k)
+                self.local_gps.append(gp_k)
+                # print(f"Optimized kernel for Cluster {k+1}: {gp_k.kernel_}")
+            except np.linalg.LinAlgError as e:
+                print(f"LinAlgError in Cluster {k+1}. Using None for GP.")
+                self.local_gps.append(None) # Store None if training fails
+        
+        print("--- All local GPs fitted ---------------------------------------------")
 
 
 
