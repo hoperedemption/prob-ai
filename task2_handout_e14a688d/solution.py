@@ -117,7 +117,7 @@ class SWAInferenceHandler(object):
         # TODO(2): optionally add/tweak hyperparameters
         swag_training_epochs: int = 30,
         swag_lr: float = 0.045,
-        swag_update_interval: int = 1,
+        swag_update_interval: int = 3,
         max_rank_deviation_matrix: int = 15,
         num_bma_samples: int = 30,
     ):
@@ -175,6 +175,7 @@ class SWAInferenceHandler(object):
         # Calibration, prediction, and other attributes
         # TODO(2): create additional attributes, e.g., for calibration
         self._calibration_threshold = None  # this is an example, feel free to be creative
+        self.temperature = torch.tensor([1.0], requires_grad=False)
 
     def update_swag_statistics(self) -> None:
         """
@@ -289,16 +290,89 @@ class SWAInferenceHandler(object):
                 if (epoch + 1) % self.swag_update_interval == 0:
                     self.update_swag_statistics()
 
+    # def run_calibration(self, validation_data: torch.utils.data.Dataset) -> None:
+    #     """
+    #     Calibrate your predictions using a small validation set.
+    #     validation_data contains well-defined and ambiguous samples,
+    #     where you can identify the latter by having label -1.
+    #     """
+    #     if self.inference_mode == InferenceMode.MAP:
+    #     # In MAP mode, simply predict argmax and do nothing else
+    #         self._calibration_threshold = 0.0
+    #         return
+
+    #     # [OUR CODE]
+    #     # Get the validation data
+    #     val_images, _, _, val_labels = validation_data.tensors
+
+    #     print("Finding optimal threshold on validation data...")
+
+    #     # 1. Get the BMA probabilities for the validation set
+    #     # We fork the RNG state to ensure this calibration step doesn't
+    #     # affect the "real" test set predictions.
+    #     with torch.random.fork_rng():
+    #         val_probabilities = self.predict_probs(val_images)
+
+    #     # 2. Get the confidences (max probability) and corresponding predictions
+    #     val_confidences, argmax_labels = torch.max(val_probabilities, dim=-1)
+
+    #     # 3. Check all possible thresholds to find the one that minimizes cost.
+    #     # The set of thresholds to check are 0.0 and all unique confidence values.
+    #     thresholds_to_check = [0.0] + list(torch.unique(val_confidences, sorted=True))
+    #     min_cost = float('inf')
+    #     best_threshold = 0.0
+
+    #     for t in thresholds_to_check:
+    #         # Predict -1 if confidence is < t, else predict the argmax class
+    #         thresholded_preds = torch.where(
+    #             val_confidences >= t,
+    #             argmax_labels,
+    #             torch.ones_like(argmax_labels) * -1
+    #         )
+    #         # Compute the cost for this threshold
+    #         cost = compute_cost(thresholded_preds, val_labels)
+
+    #         if cost < min_cost:
+    #             min_cost = cost
+    #             best_threshold = t
+
+    #     # 4. Set the class attribute to this best threshold
+    #     self._calibration_threshold = best_threshold.item() if isinstance(best_threshold, torch.Tensor) else best_threshold
+    #     print(f"Set calibration threshold to {self._calibration_threshold} (min cost on val: {min_cost:.4f})")
+
+    #     # TODO(2): perform additional calibration if desired.
+    #     #  Feel free to remove or change the prediction threshold.
+    #     val_images, val_snow_labels, val_cloud_labels, val_labels = validation_data.tensors
+    #     assert val_images.size() == (140, 3, 60, 60)  # N x C x H x W
+    #     assert val_labels.size() == (140,)
+    #     assert val_snow_labels.size() == (140,)
+    #     assert val_cloud_labels.size() == (140,)
+
+
     def run_calibration(self, validation_data: torch.utils.data.Dataset) -> None:
         """
         Calibrate your predictions using a small validation set.
-        validation_data contains well-defined and ambiguous samples,
-        where you can identify the latter by having label -1.
+        This function first learns an optimal temperature T (Temperature Scaling)
+        and then finds the best confidence threshold to minimize cost.
         """
+
+        # --- 1. Temperature Scaling ---
+        # Learn the optimal temperature T.
+        # We must use different methods for MAP (which has logits)
+        # and SWAG (which averages probabilities).
         if self.inference_mode == InferenceMode.MAP:
-            # In MAP mode, simply predict argmax and do nothing else
-            self._calibration_threshold = 0.0
-            return
+            print("Calibrating MAP model with temperature scaling (on logits)...")
+            self._calibrate_temperature_on_logits(validation_data)
+        elif self.inference_mode in (InferenceMode.SWAG_DIAGONAL, InferenceMode.SWAG_FULL):
+            print("Calibrating SWAG model with temperature scaling (on log-probabilities)...")
+            self._calibrate_temperature_on_probs(validation_data)
+        
+        # self.temperature is now set.
+
+        # if self.inference_mode == InferenceMode.MAP:
+        #     # In MAP mode, simply predict argmax and do nothing else
+        #     self._calibration_threshold = 0.0
+        #     return
 
         # TODO(1): pick a prediction threshold, either constant or adaptive.
         self._calibration_threshold = 2.0 / 3.0
@@ -306,10 +380,98 @@ class SWAInferenceHandler(object):
         # TODO(2): perform additional calibration if desired.
         #  Feel free to remove or change the prediction threshold.
         val_images, val_snow_labels, val_cloud_labels, val_labels = validation_data.tensors
-        assert val_images.size() == (140, 3, 60, 60)  # N x C x H x W
-        assert val_labels.size() == (140,)
-        assert val_snow_labels.size() == (140,)
-        assert val_cloud_labels.size() == (140,)
+
+    def _calibrate_temperature_on_logits(self, validation_data: torch.utils.data.Dataset):
+        """
+        Find optimal T for MAP mode by optimizing NLL on logits.
+        This is the "standard" temperature scaling.
+        """
+        val_images, _, _, val_labels = validation_data.tensors
+        non_ambiguous_mask = (val_labels != -1)
+        cal_images = val_images[non_ambiguous_mask]
+        cal_labels = val_labels[non_ambiguous_mask]
+
+        if cal_images.shape[0] == 0:
+            print("No non-ambiguous validation samples, using T=1.0")
+            self.temperature = torch.tensor([1.0], requires_grad=False)
+            return
+
+        # Get MAP logits
+        loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(cal_images), batch_size=32, shuffle=False)
+        all_logits = []
+        self.network.eval()
+        with torch.no_grad():
+            for (batch_images,) in loader:
+                all_logits.append(self.network(batch_images))
+        map_logits = torch.cat(all_logits).detach()
+
+        # Set up optimization for T
+        # Make temperature a learnable parameter *locally*
+        temp_param = torch.nn.Parameter(torch.ones(1))
+        optimizer = torch.optim.LBFGS([temp_param], lr=0.01, max_iter=50, line_search_fn="strong_wolfe")
+        loss_fn = torch.nn.CrossEntropyLoss()
+
+        def closure():
+            optimizer.zero_grad()
+            # Ensure T > 0
+            t = temp_param.clamp_min(1e-6)
+            scaled_logits = map_logits / t
+            loss = loss_fn(scaled_logits, cal_labels)
+            loss.backward()
+            return loss
+
+        optimizer.step(closure)
+        
+        # Save the learned temperature, ensuring it's positive
+        self.temperature = temp_param.detach().clamp_min(0.1).requires_grad_(False)
+        print(f"Learned temperature (on logits): {self.temperature.item():.4f}")
+
+    def _calibrate_temperature_on_probs(self, validation_data: torch.utils.data.Dataset):
+        """
+        Find optimal T for SWAG mode by optimizing NLL on log-probabilities.
+        This is the post-hoc method for BMA models.
+        """
+        val_images, _, _, val_labels = validation_data.tensors
+        non_ambiguous_mask = (val_labels != -1)
+        cal_images = val_images[non_ambiguous_mask]
+        cal_labels = val_labels[non_ambiguous_mask]
+
+        if cal_images.shape[0] == 0:
+            print("No non-ambiguous validation samples, using T=1.0")
+            self.temperature = torch.tensor([1.0], requires_grad=False)
+            return
+        
+        # Get BMA probabilities. We must fork RNG to not affect test predictions.
+        with torch.random.fork_rng():
+            # Temporarily set T=1.0 to get the *uncalibrated* BMA probabilities
+            original_temp = self.temperature
+            self.temperature = torch.tensor([1.0]) 
+            bma_probs = self.predict_probs(cal_images).detach()
+            self.temperature = original_temp # Restore original
+        
+        # Convert averaged probabilities to "pseudo-logits" via log(p)
+        # Add epsilon for numerical stability
+        bma_logits = torch.log(bma_probs.clamp_min(1e-40))
+
+        # Set up optimization for T
+        temp_param = torch.nn.Parameter(torch.ones(1))
+        optimizer = torch.optim.LBFGS([temp_param], lr=0.01, max_iter=50, line_search_fn="strong_wolfe")
+        loss_fn = torch.nn.CrossEntropyLoss()
+
+        def closure():
+            optimizer.zero_grad()
+            # Ensure T > 0
+            t = temp_param.clamp_min(1e-6)
+            scaled_logits = bma_logits / t
+            loss = loss_fn(scaled_logits, cal_labels)
+            loss.backward()
+            return loss
+        
+        optimizer.step(closure)
+
+        # Save the learned temperature, ensuring it's positive
+        self.temperature = temp_param.detach().clamp_min(0.1).requires_grad_(False)
+        print(f"Learned temperature (on log-probs): {self.temperature.item():.4f}")
 
     def predict_probabilities_swag(self, loader: torch.utils.data.DataLoader) -> torch.Tensor:
         """
